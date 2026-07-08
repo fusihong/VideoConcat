@@ -28,6 +28,51 @@ class SimpleVideoConcat:
 
     def concat(self, video1, video2):
         try:
+            # === 新增：文件级硬核拼接 (专为 VideoFromFile 等包含物理文件路径的对象设计) ===
+            file1 = getattr(video1, "_VideoFromFile__file", None)
+            file2 = getattr(video2, "_VideoFromFile__file", None)
+            
+            if file1 and file2 and os.path.exists(file1) and os.path.exists(file2):
+                import subprocess
+                import tempfile
+                import uuid
+                import copy
+                
+                # 在临时目录生成合并后的视频文件
+                out_file = os.path.join(tempfile.gettempdir(), f"concat_{uuid.uuid4().hex}.mp4")
+                
+                # 使用 FFmpeg 强制拼接，并自动处理分辨率不一致的问题
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", file1,
+                    "-i", file2,
+                    "-filter_complex",
+                    "[1:v][0:v]scale2ref[v1][v0]; [v0]setsar=1[v0_sar]; [v1]setsar=1[v1_sar]; [v0_sar][v1_sar]concat=n=2:v=1:a=0[outv]",
+                    "-map", "[outv]",
+                    out_file
+                ]
+                
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    # 克隆原来的对象，并将文件路径指向新生成的 10s 视频文件
+                    new_video = copy.copy(video1)
+                    setattr(new_video, "_VideoFromFile__file", out_file)
+                    
+                    # 修正其他可能限制长度的属性
+                    if hasattr(new_video, "get_duration"):
+                        try:
+                            d1 = video1.get_duration()
+                            d2 = video2.get_duration()
+                            if hasattr(new_video, "duration"):
+                                new_video.duration = d1 + d2
+                        except:
+                            pass
+                            
+                    return (new_video,)
+                except Exception as ffmpeg_err:
+                    print(f"FFmpeg fallback failed: {ffmpeg_err}")
+            # =========================================================================
+
             # 1. 递归提取 Tensor，并生成“还原函数”（确保下游节点收到的是它认识的格式：比如 Tuple 或 Dict）
             def extract(v):
                 if isinstance(v, torch.Tensor):
