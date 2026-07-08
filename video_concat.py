@@ -1,9 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
-import traceback
 
-# 这是一个 ComfyUI 的小技巧，用来创建一个“万能类型”，可以连接任何输出节点（无论是 IMAGE 还是 VIDEO 类型）
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
@@ -29,145 +27,94 @@ class SimpleVideoConcat:
     CATEGORY = "Video/Utils"
 
     def concat(self, video1, video2):
-        # 建立一个本地日志文件，方便在云房间中排查任何疑难杂症
-        log_path = os.path.join(os.path.dirname(__file__), "debug.log")
-        def log_debug(msg):
-            print(msg)
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(msg + "\n")
-            except:
-                pass
-
         try:
-            with open(log_path, "w", encoding="utf-8") as f:
-                f.write("--- VideoConcat Run ---\n")
-            
-            log_debug(f"Input type v1: {type(video1)}")
-            log_debug(f"Input type v2: {type(video2)}")
-
-            # 辅助函数：提取 Tensor 并记录原始数据格式
-            def extract_tensor(v):
+            # 1. 递归提取 Tensor，并生成“还原函数”（确保下游节点收到的是它认识的格式：比如 Tuple 或 Dict）
+            def extract(v):
                 if isinstance(v, torch.Tensor):
-                    return v, None
+                    return v, lambda x: x
                 elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                    return torch.cat(v, dim=0), None
+                    return torch.cat(v, dim=0), lambda x: x 
                 elif isinstance(v, tuple) and len(v) > 0:
-                    return extract_tensor(v[0])
+                    t, _ = extract(v[0])
+                    if t is not None:
+                        def pack_tuple(x):
+                            l = list(v)
+                            l[0] = x
+                            return tuple(l)
+                        return t, pack_tuple
                 elif isinstance(v, dict):
-                    # 尝试从字典中提取常见名称的 Tensor
                     for k in ["samples", "video", "image", "images", "frames"]:
                         if k in v and isinstance(v[k], torch.Tensor):
-                            return v[k], k
-                    # 实在找不到，取第一个 Tensor
+                            def pack_dict(x):
+                                d = v.copy()
+                                d[k] = x
+                                if "audio" in d: del d["audio"]
+                                if "frame_count" in d: d["frame_count"] = x.shape[0] if x.ndim==4 else x.shape[1]
+                                return d
+                            return v[k], pack_dict
                     for k, val in v.items():
                         if isinstance(val, torch.Tensor):
-                            return val, k
+                            def pack_dict_any(x):
+                                d = v.copy()
+                                d[k] = x
+                                return d
+                            return val, pack_dict_any
                 return None, None
 
-            v1, k1 = extract_tensor(video1)
-            v2, k2 = extract_tensor(video2)
+            v1, pack_v1 = extract(video1)
+            v2, pack_v2 = extract(video2)
 
-            # 如果传进来的不是 Tensor，打印报错信息原路返回
             if v1 is None or v2 is None:
-                log_debug(f"Failed to extract tensor. v1 type: {type(v1)}, v2 type: {type(v2)}")
-                return (video1,)
+                raise ValueError(f"无法从输入中提取视频 Tensor。v1类型:{type(video1)}, v2类型:{type(video2)}")
 
-            log_debug(f"v1 shape: {v1.shape}, dtype: {v1.dtype}, device: {v1.device}")
-            log_debug(f"v2 shape: {v2.shape}, dtype: {v2.dtype}, device: {v2.device}")
-
-            # 确保处于同一个设备和数据类型（例如都放在 GPU/CPU）
+            # 2. 对齐设备和数据类型
             v2 = v2.to(v1.device, dtype=v1.dtype)
 
-            # 自动推断应该在哪个维度进行拼接 (Time 维度) 以及 高宽 (H, W) 的维度
+            # 3. 维度对齐与推断
+            if v1.ndim == 3: v1 = v1.unsqueeze(0)
+            if v2.ndim == 3: v2 = v2.unsqueeze(0)
+
             concat_dim = 0
             h_dim, w_dim = 1, 2
             
-            if v1.ndim == 5:
-                if v1.shape[1] in [1, 3, 4]: # [B, C, T, H, W]
-                    concat_dim = 2
-                    h_dim, w_dim = 3, 4
-                elif v1.shape[2] in [1, 3, 4]: # [B, T, C, H, W]
-                    concat_dim = 1
-                    h_dim, w_dim = 3, 4
-                elif v1.shape[4] in [1, 3, 4]: # [B, T, H, W, C]
-                    concat_dim = 1
-                    h_dim, w_dim = 2, 3
-                else:
-                    concat_dim = 1 # 默认猜测 1 是时间维度
-                    h_dim, w_dim = 3, 4
-            elif v1.ndim == 4:
-                if v1.shape[3] in [1, 3, 4]: # [T, H, W, C] - 这是 ComfyUI 最标准的图像批次/视频格式
-                    concat_dim = 0
-                    h_dim, w_dim = 1, 2
-                elif v1.shape[1] in [1, 3, 4]: # [B, C, H, W] - PyTorch 原生格式
-                    concat_dim = 0
-                    h_dim, w_dim = 2, 3
-                else:
-                    concat_dim = 0
-                    h_dim, w_dim = 1, 2
+            if v1.ndim == 4:
+                if v1.shape[3] in [1, 3, 4]: # [T, H, W, C]
+                    concat_dim = 0; h_dim, w_dim = 1, 2
+                elif v1.shape[1] in [1, 3, 4]: # [B, C, H, W]
+                    concat_dim = 0; h_dim, w_dim = 2, 3
+            elif v1.ndim == 5: # [B, T, C, H, W] 等
+                concat_dim = 1; h_dim, w_dim = 3, 4
 
-            log_debug(f"Determined concat_dim: {concat_dim}, h_dim: {h_dim}, w_dim: {w_dim}")
-
-            # 检查尺寸是否一致，如果不一致则将 v2 缩放到 v1 的尺寸
+            # 4. 高宽缩放 (转换到 float32 以防 float16/uint8 在 interpolate 时报错)
             if v1.shape[h_dim] != v2.shape[h_dim] or v1.shape[w_dim] != v2.shape[w_dim]:
-                log_debug(f"Resizing v2 from {v2.shape} to match v1 {v1.shape}")
                 target_h, target_w = v1.shape[h_dim], v1.shape[w_dim]
+                v2_float = v2.to(torch.float32)
                 
-                if v2.ndim == 4 and v2.shape[3] in [1, 3, 4]: 
-                    v2_p = v2.permute(0, 3, 1, 2) 
+                if v2_float.ndim == 4 and v2_float.shape[3] in [1, 3, 4]: 
+                    v2_p = v2_float.permute(0, 3, 1, 2)
                     v2_p = F.interpolate(v2_p, size=(target_h, target_w), mode='bilinear')
-                    v2 = v2_p.permute(0, 2, 3, 1) 
-                elif v2.ndim == 5 and v2.shape[1] in [1, 3, 4]: 
-                    b, c, t, h, w = v2.shape
-                    v2_p = v2.permute(0, 2, 1, 3, 4).reshape(b*t, c, h, w)
-                    v2_p = F.interpolate(v2_p, size=(target_h, target_w), mode='bilinear')
-                    v2 = v2_p.reshape(b, t, c, target_h, target_w).permute(0, 2, 1, 3, 4)
-                elif v2.ndim == 5 and v2.shape[2] in [1, 3, 4]: 
-                    b, t, c, h, w = v2.shape
-                    v2_p = v2.reshape(b*t, c, h, w)
-                    v2_p = F.interpolate(v2_p, size=(target_h, target_w), mode='bilinear')
-                    v2 = v2_p.reshape(b, t, c, target_h, target_w)
-                elif v2.ndim == 5 and v2.shape[4] in [1, 3, 4]: 
-                    b, t, h, w, c = v2.shape
-                    v2_p = v2.view(b*t, h, w, c).permute(0, 3, 1, 2) 
-                    v2_p = F.interpolate(v2_p, size=(target_h, target_w), mode='bilinear')
-                    v2 = v2_p.permute(0, 2, 3, 1).view(b, t, target_h, target_w, c)
-                elif v2.ndim == 4 and v2.shape[1] in [1, 3, 4]: 
-                    v2 = F.interpolate(v2, size=(target_h, target_w), mode='bilinear')
-                else:
-                    log_debug("Unsupported shape for resizing, skipping resize")
+                    v2_float = v2_p.permute(0, 2, 3, 1)
+                elif v2_float.ndim == 4 and v2_float.shape[1] in [1, 3, 4]:
+                    v2_float = F.interpolate(v2_float, size=(target_h, target_w), mode='bilinear')
+                
+                v2 = v2_float.to(v1.dtype)
 
-            # 真正进行视频拼接！
-            log_debug(f"Concatenating on dim {concat_dim}...")
+            # 5. 通道数对齐 (防止一个带 Alpha 通道，一个不带导致 cat 报错)
+            if v1.shape[-1] != v2.shape[-1] and v1.ndim == 4 and v1.shape[3] in [1, 3, 4]:
+                min_c = min(v1.shape[-1], v2.shape[-1])
+                v1 = v1[..., :min_c]
+                v2 = v2[..., :min_c]
+
+            # 6. 拼接
             out_tensor = torch.cat((v1, v2), dim=concat_dim)
-            log_debug(f"Output tensor shape: {out_tensor.shape}")
 
-            # 还原输出格式（如果之前输入的是字典，原样包回去，以适配下游 BA 节点）
-            if isinstance(video1, dict) and k1 is not None:
-                out_dict = video1.copy()
-                out_dict[k1] = out_tensor
-                
-                # 【关键修复】如果原字典中包含音频 (audio) 或帧数 (frame_count) 等元数据，
-                # 它们可能会误导 Save Video 节点，导致最终被截断回 5 秒。
-                if "audio" in out_dict:
-                    del out_dict["audio"]  # 删除音频，防止 Save Video 按照第一段视频的音频长度来截断画面
-                
-                t_len = out_tensor.shape[concat_dim]
-                if "frame_count" in out_dict:
-                    out_dict["frame_count"] = t_len
-                if "duration" in out_dict and "frame_count" in video1:
-                    # 如果有 duration，粗略按比例翻倍
-                    out_dict["duration"] = out_dict["duration"] * (t_len / video1["frame_count"])
-
-                log_debug(f"Returning as dict. Cleaned audio, updated frame_count to {t_len}.")
-                return (out_dict,)
-
-            log_debug("Returning as tensor.")
-            return (out_tensor,)
+            # 7. 完美还原包装
+            out_final = pack_v1(out_tensor)
+            return (out_final,)
 
         except Exception as e:
-            # 防止流程彻底崩溃，如果拼接失败打印日志，返回原视频1
-            log_debug(f"Exception occurred: {e}")
-            log_debug(traceback.format_exc())
-            return (video1,)
+            # 【取消静默报错】如果出错了，直接抛出异常让节点变紫爆红！
+            import traceback
+            error_msg = f"拼接失败 (VideoConcat Error):\n{str(e)}\n\n"
+            error_msg += traceback.format_exc()
+            raise RuntimeError(error_msg)
