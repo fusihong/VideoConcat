@@ -147,7 +147,20 @@ class SimpleVideoConcat:
             if isinstance(video1, dict) and k1 is not None:
                 out_dict = video1.copy()
                 out_dict[k1] = out_tensor
-                log_debug("Returning as dict.")
+                
+                # 【关键修复】如果原字典中包含音频 (audio) 或帧数 (frame_count) 等元数据，
+                # 它们可能会误导 Save Video 节点，导致最终被截断回 5 秒。
+                if "audio" in out_dict:
+                    del out_dict["audio"]  # 删除音频，防止 Save Video 按照第一段视频的音频长度来截断画面
+                
+                t_len = out_tensor.shape[concat_dim]
+                if "frame_count" in out_dict:
+                    out_dict["frame_count"] = t_len
+                if "duration" in out_dict and "frame_count" in video1:
+                    # 如果有 duration，粗略按比例翻倍
+                    out_dict["duration"] = out_dict["duration"] * (t_len / video1["frame_count"])
+
+                log_debug(f"Returning as dict. Cleaned audio, updated frame_count to {t_len}.")
                 return (out_dict,)
 
             log_debug("Returning as tensor.")
