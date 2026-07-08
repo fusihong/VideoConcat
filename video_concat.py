@@ -1,6 +1,13 @@
 import torch
 import torch.nn.functional as F
 
+# 这是一个 ComfyUI 的小技巧，用来创建一个“万能类型”，可以连接任何输出节点（无论是 IMAGE 还是 VIDEO 类型）
+class AnyType(str):
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+any_type = AnyType("*")
+
 class SimpleVideoConcat:
     def __init__(self):
         pass
@@ -9,8 +16,8 @@ class SimpleVideoConcat:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "video1": ("IMAGE",),
-                "video2": ("IMAGE",),
+                "video1": (any_type,),
+                "video2": (any_type,),
             },
         }
 
@@ -20,6 +27,12 @@ class SimpleVideoConcat:
     CATEGORY = "Video/Utils"
 
     def concat(self, video1, video2):
+        # 兼容处理：如果传入的是张量列表，则先合并为单个大张量
+        if isinstance(video1, list):
+            video1 = torch.cat(video1, dim=0)
+        if isinstance(video2, list):
+            video2 = torch.cat(video2, dim=0)
+
         # ComfyUI 中的视频（图像批次）形状通常为 (B, H, W, C)
         # B 是帧数，H 是高度，W 是宽度，C 是通道数
         
