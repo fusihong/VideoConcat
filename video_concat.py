@@ -21,7 +21,7 @@ class SimpleVideoConcat:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = (any_type,)
     RETURN_NAMES = ("video",)
     FUNCTION = "concat"
     CATEGORY = "Video/Utils"
