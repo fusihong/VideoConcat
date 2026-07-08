@@ -45,7 +45,7 @@ class SimpleVideoConcat:
                 elif isinstance(v, dict):
                     for k in ["samples", "video", "image", "images", "frames"]:
                         if k in v and isinstance(v[k], torch.Tensor):
-                            def pack_dict(x):
+                            def pack_dict(x, k=k):
                                 d = v.copy()
                                 d[k] = x
                                 if "audio" in d: del d["audio"]
@@ -54,18 +54,57 @@ class SimpleVideoConcat:
                             return v[k], pack_dict
                     for k, val in v.items():
                         if isinstance(val, torch.Tensor):
-                            def pack_dict_any(x):
+                            def pack_dict_any(x, k=k):
                                 d = v.copy()
                                 d[k] = x
                                 return d
                             return val, pack_dict_any
+                
+                # 处理未知的自定义对象 (例如 BA Load Video 返回的 VideoFromFile)
+                # 1. 尝试直接从它的属性 (vars) 中寻找 Tensor
+                if hasattr(v, '__dict__'):
+                    for k, val in vars(v).items():
+                        if isinstance(val, torch.Tensor):
+                            def pack_obj(x, key=k):
+                                import copy
+                                try:
+                                    new_v = copy.copy(v)
+                                except:
+                                    new_v = v
+                                setattr(new_v, key, x)
+                                if hasattr(new_v, "audio"): setattr(new_v, "audio", None)
+                                if hasattr(new_v, "frame_count"): setattr(new_v, "frame_count", x.shape[0] if x.ndim==4 else x.shape[1])
+                                return new_v
+                            return val, pack_obj
+                
+                # 2. 尝试调用可能的方法获取 Tensor
+                for method in ["get_video", "get_tensor", "to_tensor", "get_frames"]:
+                    if hasattr(v, method) and callable(getattr(v, method)):
+                        try:
+                            val = getattr(v, method)()
+                            if isinstance(val, torch.Tensor):
+                                # 如果是通过方法获取的，直接返回拼接后的 Tensor，看下游节点是否兼容
+                                return val, lambda x: x
+                        except:
+                            pass
+
                 return None, None
 
             v1, pack_v1 = extract(video1)
             v2, pack_v2 = extract(video2)
 
             if v1 is None or v2 is None:
-                raise ValueError(f"无法从输入中提取视频 Tensor。v1类型:{type(video1)}, v2类型:{type(video2)}")
+                def get_debug_info(v):
+                    try:
+                        return f"\nvars: {vars(v)}\n\ndir: {dir(v)}"
+                    except:
+                        try:
+                            return f"\ndir: {dir(v)}"
+                        except:
+                            return "无法获取属性"
+                
+                debug_v1 = get_debug_info(video1)
+                raise ValueError(f"无法从输入中提取视频 Tensor。\n\nv1类型: {type(video1)}\nv1内部结构: {debug_v1}")
 
             # 2. 对齐设备和数据类型
             v2 = v2.to(v1.device, dtype=v1.dtype)
